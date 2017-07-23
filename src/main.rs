@@ -25,73 +25,112 @@ use vulkano_win::VkSurfaceBuild;
 use vulkano::sync::GpuFuture;
 // }}}
 // {{{ Audio
-extern crate portaudio;
+extern crate cubeb;
+
+use cubeb::Frame;
 // }}}
 // {{{ General
 use std::thread;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 // }}}
 
-const CHANNELS: i32 = 2;
-const NUM_SECONDS: i32 = 5;
-// const SAMPLE_RATE: f64 = 44_100.0;
-const FRAMES_PER_BUFFER: u32 = 64;
+const CHANNELS: u32 = 2;
+const STREAM_FORMAT: cubeb::SampleFormat = cubeb::SampleFormat::Float32NE;
+
+type FrameType = cubeb::StereoFrame<f32>;
+struct StreamCallbackImpl;
+
+impl cubeb::StreamCallback for StreamCallbackImpl {
+    type Frame = FrameType;
+
+    fn data_callback(
+        &mut self,
+        input: &[Self::Frame],
+        output: &mut [Self::Frame]
+    ) -> isize {
+        for frame in input {
+            println!("Left:  {}", frame.l);
+            println!("Right: {}", frame.r);
+        }
+
+        output.len() as isize
+    }
+
+    fn state_callback(&mut self, state: cubeb::State) {
+        println!("Stream state: {:?}", state);
+    }
+}
 
 fn main() {
-    let requested_device_index = Some(8);  // TODO: Make an argument for it
-    let pa = portaudio::PortAudio::new().expect("Could not initialize PortAudio.");
-    
-    if let None = requested_device_index {
-        let devices: portaudio::Devices = pa.devices().expect("Couldn't request audio devices.");
+    let args: Vec<String> = std::env::args().collect();
+    let requested_device_index: Option<usize> = if args.len() > 1 {
+        match args[1].parse() {
+            Ok(arg) => Some(arg),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let ctx = cubeb::Context::init("streamsplash-cubeb-ctx", None)
+        .expect("Could not create a Cubeb context.");
+    let devices = ctx.enumerate_devices(cubeb::DEVICE_TYPE_INPUT)
+        .expect("Could not enumerate Cubeb devices.");
 
+    if let None = requested_device_index {
         println!("Choose one of the following devices by their index:");
 
-        for device in devices {
-            match device {
-                Ok((device_index, device_info)) => {
-                    println!("{}: {}", device_index.0, device_info.name);
-                },
-                Err(error) => {
-                    panic!("Could not retrieve the next device: {}", error);
-                }
+        let mut device_index = 0;
+
+        for device_info in (*devices).iter() {
+            if !device_info.friendly_name().is_some() {
+                continue;
             }
+
+            println!("{}: {}", device_index, device_info.friendly_name().unwrap());
+            device_index += 1;
         }
 
         std::process::exit(0);
     }
 
-    let device_index = portaudio::DeviceIndex(requested_device_index.unwrap());
-    let device_info = pa.device_info(device_index).expect("Could not request info about the desired device.");
-    let settings = portaudio::stream::InputSettings::with_flags(
-        portaudio::stream::Parameters::new(
-            device_index,
-            CHANNELS,
-            true,
-            device_info.default_low_input_latency
-        ),
-        device_info.default_sample_rate,
-        FRAMES_PER_BUFFER,
-        portaudio::stream::flags::Flags::empty()
-    );
+    let selected_device_info = (*devices).iter().nth(requested_device_index.unwrap());
 
-    // This routine will be called by the PortAudio engine when audio is needed. It may called at
-    // interrupt level on some machines so don't do anything that could mess up the system like
-    // dynamic resource allocation or IO.
-    let callback = move |portaudio::InputStreamCallbackArgs::<i32> { buffer, frames, flags, time }| {
-        for idx in (0..frames).map(|x| 2 * x) {
-            println!("{} : {}", buffer[idx], buffer[idx + 1]);
-        }
-        portaudio::Continue
-    };
+    if let None = selected_device_info {
+        println!("No such device found.");
+        std::process::exit(1);
+    }
 
-    let mut stream = pa.open_non_blocking_stream(settings, callback)
-        .expect("Could not open a non-blocking stream.");
+    let selected_device_info = selected_device_info.unwrap();
 
-    stream.start().expect("Could not start a non-blocking stream.");
+    println!("Selected device: {}", selected_device_info.friendly_name().unwrap());
 
-    loop {}
+    let channel_layout = ctx.preferred_channel_layout()
+        .expect("Could not retrieve the preferred channel layout.");
+    let params = cubeb::StreamParamsBuilder::new()
+        .format(STREAM_FORMAT)
+        .rate(selected_device_info.default_rate())
+        .channels(CHANNELS)
+        .layout(FrameType::layout())
+        .take();
+    let stream_init_opts = cubeb::StreamInitOptionsBuilder::new()
+        .stream_name("streamsplash-cubeb-stream")
+        .input_device(selected_device_info.devid())
+        .input_stream_param(&params)
+        .latency(selected_device_info.latency_lo())
+        .take();
+    let stream = ctx.stream_init(
+        &stream_init_opts,
+        StreamCallbackImpl
+    ).map_err(|e| panic!("Failed to create Cubeb stream: {:?}", e)).unwrap();
+
+    stream.start().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    stream.stop().unwrap();
 }
+
+// END OF AUDIO CODE
+// BEGINNING OF GPU CODE
 
 fn main_t() {
     // The start of this example is exactly the same as `triangle`. You should read the
