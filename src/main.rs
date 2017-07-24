@@ -113,11 +113,15 @@ fn main() {
         .channels(CHANNELS)
         .layout(FrameType::layout())
         .take();
+    let latency = match selected_device_info.latency_lo() {
+        0 => ctx.min_latency(&params).expect("Could not get min latency"),
+        l => l,
+    };
     let stream_init_opts = cubeb::StreamInitOptionsBuilder::new()
         .stream_name("streamsplash-cubeb-stream")
         .input_device(selected_device_info.devid())
         .input_stream_param(&params)
-        .latency(selected_device_info.latency_lo())
+        .latency(latency)
         .take();
     let stream = ctx.stream_init(
         &stream_init_opts,
