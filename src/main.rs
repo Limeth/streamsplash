@@ -30,8 +30,7 @@ extern crate cubeb;
 use cubeb::Frame;
 // }}}
 // {{{ General
-use std::thread;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 // }}}
 
@@ -105,8 +104,6 @@ fn main() {
 
     println!("Selected device: {}", selected_device_info.friendly_name().unwrap());
 
-    let channel_layout = ctx.preferred_channel_layout()
-        .expect("Could not retrieve the preferred channel layout.");
     let params = cubeb::StreamParamsBuilder::new()
         .format(STREAM_FORMAT)
         .rate(selected_device_info.default_rate())
