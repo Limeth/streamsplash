@@ -12,3 +12,6 @@ image = "0.14.0"
 winit = "0.6.4"
 time = "0.1.37"
 cubeb = { git = "https://github.com/djg/cubeb-rs", branch = "workspace-reorg" }
+rustfft = "2.0.0"
+clap = "2.25.1"
+seqlock = "0.1.1"

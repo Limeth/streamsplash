@@ -26,19 +26,57 @@ use vulkano::sync::GpuFuture;
 // }}}
 // {{{ Audio
 extern crate cubeb;
+extern crate rustfft;
 
 use cubeb::Frame;
+use rustfft::{FFTplanner, FFT};
+use rustfft::num_complex::Complex;
+use rustfft::num_traits::Zero;
 // }}}
 // {{{ General
+#[macro_use]
+extern crate clap;
+extern crate seqlock;
+
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
+use std::ops::Deref;
+use clap::Arg;
+use seqlock::SeqLock;
 // }}}
 
+const ARG_DEVICE: &str = "DEVICE";
+const ARG_FPS: &str = "FPS";
 const CHANNELS: u32 = 2;
 const STREAM_FORMAT: cubeb::SampleFormat = cubeb::SampleFormat::Float32NE;
 
 type FrameType = cubeb::StereoFrame<f32>;
-struct StreamCallbackImpl;
+
+struct StreamCallbackImpl {
+    pub fft_resolution: usize,
+    pub fft: Arc<FFT<f32>>,
+    pub fft_input_index: usize,
+    pub fft_input: Vec<f32>,
+    pub fft_input_ready: Arc<Mutex<Vec<f32>>>,
+    pub consumed: Arc<SeqLock<bool>>,
+}
+
+impl StreamCallbackImpl {
+    fn new(rate: u32, fps: u32) -> Self {
+        let mut planner = FFTplanner::new(false);
+        let fft_resolution = (rate / fps) as usize;
+
+        StreamCallbackImpl {
+            fft_resolution,
+            fft: planner.plan_fft(fft_resolution),
+            fft_input_index: 0,
+            fft_input: vec![Zero::zero(); fft_resolution],
+            fft_input_ready: Arc::new(Mutex::new(vec![Zero::zero(); fft_resolution])),
+            consumed: Arc::new(SeqLock::new(false)),
+        }
+    }
+}
 
 impl cubeb::StreamCallback for StreamCallbackImpl {
     type Frame = FrameType;
@@ -46,14 +84,24 @@ impl cubeb::StreamCallback for StreamCallbackImpl {
     fn data_callback(
         &mut self,
         input: &[Self::Frame],
-        output: &mut [Self::Frame]
+        _: &mut [Self::Frame]
     ) -> isize {
         for frame in input {
-            println!("Left:  {}", frame.l);
-            println!("Right: {}", frame.r);
+            let avg = (frame.l + frame.r) / 2.0;
+            self.fft_input[self.fft_input_index] = avg;
+            self.fft_input_index += 1;
+
+            if self.fft_input_index >= self.fft_resolution {
+                self.fft_input_index = 0;
+                let mut fft_input_ready = self.fft_input_ready.deref().lock()
+                    .expect("Poisoned Mutex.");
+
+                *fft_input_ready = self.fft_input.clone();
+                *self.consumed.lock_write() = false;
+            }
         }
 
-        output.len() as isize
+        input.len() as isize
     }
 
     fn state_callback(&mut self, state: cubeb::State) {
@@ -62,15 +110,27 @@ impl cubeb::StreamCallback for StreamCallbackImpl {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let requested_device_index: Option<usize> = if args.len() > 1 {
-        match args[1].parse() {
+    let matches = app_from_crate!()
+        .arg(Arg::with_name(ARG_FPS)
+             .long("fps")
+             .short("f")
+             .help("The framerate to calculate the audio FFT at."))
+        .arg(Arg::with_name(ARG_DEVICE))
+        .get_matches();
+    let requested_device_index: Option<usize> = if let Some(arg) = matches.value_of(ARG_DEVICE) {
+        match arg.parse() {
             Ok(arg) => Some(arg),
             Err(_) => None,
         }
     } else {
         None
     };
+    let fps: u32 = matches.value_of(ARG_FPS).and_then(|fps| {
+        match fps.parse() {
+            Ok(fps) => Some(fps),
+            Err(_) => None,
+        }
+    }).unwrap_or(60);
     let ctx = cubeb::Context::init("streamsplash-cubeb-ctx", None)
         .expect("Could not create a Cubeb context.");
     let devices = ctx.enumerate_devices(cubeb::DEVICE_TYPE_INPUT)
@@ -104,9 +164,10 @@ fn main() {
 
     println!("Selected device: {}", selected_device_info.friendly_name().unwrap());
 
+    let rate = selected_device_info.default_rate();
     let params = cubeb::StreamParamsBuilder::new()
         .format(STREAM_FORMAT)
-        .rate(selected_device_info.default_rate())
+        .rate(rate)
         .channels(CHANNELS)
         .layout(FrameType::layout())
         .take();
@@ -120,14 +181,48 @@ fn main() {
         .input_stream_param(&params)
         .latency(latency)
         .take();
+    let callback = StreamCallbackImpl::new(rate, fps);
+    let fft_resolution = callback.fft_resolution;
+    let fft = callback.fft.clone();
+    let fft_input_ready = callback.fft_input_ready.clone();
+    let consumed = callback.consumed.clone();
     let stream = ctx.stream_init(
         &stream_init_opts,
-        StreamCallbackImpl
+        callback,
     ).map_err(|e| panic!("Failed to create Cubeb stream: {:?}", e)).unwrap();
 
     stream.start().unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    stream.stop().unwrap();
+
+    {
+        std::thread::spawn(move || {
+            let mut fft_input_vec = Vec::with_capacity(fft_resolution);
+            let mut fft_output_vec = Vec::with_capacity(fft_resolution);
+
+            loop {
+                if !consumed.read() {
+                    let mut consumed = consumed.lock_write();
+                    let fft_input_ready = fft_input_ready.lock().unwrap();
+
+                    for ref float in fft_input_ready.deref() {
+                        fft_input_vec.push(Complex::new(**float, 0_f32));
+                    }
+
+                    fft_output_vec.resize(fft_input_vec.len(), Complex::new(0_f32, 0_f32));
+                    fft.process(&mut fft_input_vec, &mut fft_output_vec);
+                    fft_input_vec.clear();
+                    fft_output_vec.clear();
+
+                    *consumed = true;
+                }
+
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+
+    loop {}
+    // std::thread::sleep(Duration::from_millis(500));
+    // stream.stop().unwrap();
 }
 
 // END OF AUDIO CODE
